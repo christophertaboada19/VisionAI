@@ -1,0 +1,12 @@
+* text=auto
+Dockerfile text eol=lf
+*.sh text eol=lf
+*.yaml text eol=lf
+*.onnx binary
+*.pt binary
+*.webp binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.jfif binary
+*.docx binary

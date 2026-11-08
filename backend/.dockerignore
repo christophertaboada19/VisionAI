@@ -1,0 +1,11 @@
+# Nunca copiar secretos ni archivos pesados de desarrollo a la imagen
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+notebooks/
+yolov8n.pt
+*.md

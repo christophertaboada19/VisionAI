@@ -1,0 +1,29 @@
+# ---- Secretos: NUNCA subir ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---- Dependencias y compilados ----
+node_modules/
+frontend/dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# ---- Editores / sistema ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Generados por Ultralytics al exportar/ejecutar ----
+runs/
+backend/runs/
+
+# ---- Documentos temporales de Office ----
+~$*

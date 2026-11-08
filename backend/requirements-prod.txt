@@ -1,0 +1,11 @@
+# Dependencias de PRODUCCIÓN (Docker / Render gratis): sin PyTorch ni Ultralytics.
+# YOLOv8n corre con ONNX Runtime (yolov8n.onnx). Para desarrollo local use requirements.txt.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+numpy==2.1.3
+opencv-python-headless==4.10.0.84
+onnxruntime==1.20.1
+httpx==0.28.1
+pydantic==2.10.3
+python-dotenv==1.0.1

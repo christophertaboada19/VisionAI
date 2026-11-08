@@ -1,0 +1,43 @@
+# =============================================================================
+# Render Blueprint — Backend de VISION AI (FastAPI + OpenCV + YOLOv8n ONNX) con Docker.
+# Plan GRATUITO: 512 MB RAM, 0.1 vCPU. El servicio se "duerme" tras 15 min sin uso y tarda
+# ~50 s en despertar (la app muestra un aviso mientras tanto).
+# Uso: Render > New > Blueprint > seleccionar este repositorio.
+# =============================================================================
+services:
+  - type: web
+    name: vision-ai-backend
+    runtime: docker
+    plan: free
+    region: oregon
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # Dominio del frontend en Vercel (sin "/" final). Ej: https://vision-ai.vercel.app
+      - key: ALLOWED_ORIGINS
+        sync: false
+      # Opcional: aceptar los despliegues de vista previa de SU proyecto de Vercel, p. ej.
+      #   https://visionai-.*-christophertaboada19s-projects\.vercel\.app
+      # (No use https://.*\.vercel\.app: permitiría a cualquier proyecto de Vercel usar su backend.)
+      - key: ALLOWED_ORIGIN_REGEX
+        sync: false
+      # Motor liviano (sin PyTorch) y límites para 0.1 vCPU
+      - key: VISION_ENGINE
+        value: onnx
+      - key: VISION_THREADS
+        value: "1"
+      - key: VISION_MAX_IMGSZ
+        value: "640"
+      # Alertas al celular (opcionales; también se pueden poner desde la app en Configuración)
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: NTFY_TOPIC
+        sync: false
+      # Supabase (opcional en el backend: solo informativo en /health)
+      - key: SUPABASE_URL
+        sync: false
