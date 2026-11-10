@@ -9,6 +9,7 @@ import { saveSettings } from "@/core/application/operations";
 import type { CameraConfig, CameraSourceKind } from "@/core/domain/entities";
 import { useCameras, useSettings } from "@/shared/hooks/useRepository";
 import { ALERT_TARGET_OPTIONS, DEFAULT_CAMERAS } from "@/modules/scenarios/data/seedCatalog";
+import { CapacityInput } from "@/modules/scenarios/components/CapacityInput";
 import { SCENARIOS } from "@/modules/scenarios/data/scenes";
 import { Button, Card, CardHeader, cx, Field, Input, Notice, PageHeader, Select, Toggle } from "@/shared/ui";
 
@@ -374,7 +375,10 @@ export function SettingsPage() {
                       ))}
                     </Select>
                   </Field>
-                  <Field label="Qué detectar como alerta">
+                  <Field label={cam.scenarioId === "retail-store" ? "Aforo máximo de la sala" : "Qué detectar como alerta"} htmlFor={`cap-${cam.id}`}>
+                    {cam.scenarioId === "retail-store" ? (
+                      <CapacityInput id={`cap-${cam.id}`} target={cam.alertTarget} onChange={(t) => handleUpdateCamera(cam.id, { alertTarget: t })} />
+                    ) : (
                     <Select
                       value={cam.alertTarget}
                       onChange={(e) => handleUpdateCamera(cam.id, { alertTarget: e.target.value })}
@@ -386,6 +390,7 @@ export function SettingsPage() {
                         </option>
                       ))}
                     </Select>
+                    )}
                   </Field>
                 </div>
 

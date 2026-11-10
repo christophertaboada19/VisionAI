@@ -66,8 +66,8 @@ export const DEFAULT_RULES: Rule[] = [
   {
     id: "rule-occupancy",
     name: "Aforo máximo excedido",
-    description: "Cuatro o más personas simultáneas detectadas en el salón o área monitoreada.",
-    condition: { kind: "count", classId: "person", min: 4 },
+    description: "Más personas que el aforo máximo configurado para la cámara o el análisis (por defecto 3).",
+    condition: { kind: "pattern", patternType: "crowding" },
     threshold: 0.55,
     severity: "medium",
     enabled: true,
@@ -92,6 +92,9 @@ export const DEFAULT_RULES: Rule[] = [
   },
 ];
 
+/** Aforo por defecto (personas permitidas). Se alerta cuando hay MÁS personas que este número. */
+export const DEFAULT_MAX_OCCUPANCY = 3;
+
 export const ALERT_TARGET_OPTIONS: Record<string, { value: string; label: string; shortLabel: string }[]> = {
   "public-traffic": [
     { value: "all", label: "Todos los incidentes viales (Carril restringido, Distancia, Pesados y Congestión)", shortLabel: "Todos los incidentes viales" },
@@ -112,7 +115,7 @@ export const ALERT_TARGET_OPTIONS: Record<string, { value: string; label: string
     { value: "deformed", label: "Solo alertar botellas aplastadas / deformadas o sin tapa", shortLabel: "Solo botellas deformadas / sin tapa" },
   ],
   "retail-store": [
-    { value: "all", label: "Exceso de aforo máximo en sala (4+ personas)", shortLabel: "Exceso de aforo (4+ personas)" },
+    { value: "all", label: `Exceso de aforo máximo en sala (más de ${DEFAULT_MAX_OCCUPANCY} personas)`, shortLabel: `Aforo máx. ${DEFAULT_MAX_OCCUPANCY} personas` },
   ],
   "abandoned-objects": [
     { value: "all", label: "Mochila, bolso o maleta sola más de 10 segundos", shortLabel: "Bulto solo > 10 s" },
@@ -122,7 +125,22 @@ export const ALERT_TARGET_OPTIONS: Record<string, { value: string; label: string
   ],
 };
 
+/** El aforo elegido viaja al backend dentro de alertTarget como "capacity:N". */
+export function capacityTarget(n: number): string {
+  const v = Math.max(1, Math.min(10000, Math.round(Number.isFinite(n) ? n : DEFAULT_MAX_OCCUPANCY)));
+  return `capacity:${v}`;
+}
+
+export function capacityFromTarget(target?: string): number {
+  const m = /^capacity:(d+)$/.exec(target ?? "");
+  return m ? Math.max(1, Math.min(10000, Number(m[1]))) : DEFAULT_MAX_OCCUPANCY;
+}
+
 export function getAlertTargetLabel(scenarioId: string, target = "all", short = false): string {
+  if (scenarioId === "retail-store") {
+    const n = capacityFromTarget(target);
+    return short ? `Aforo máx. ${n} personas` : `Exceso de aforo máximo en sala (más de ${n} personas)`;
+  }
   const list = ALERT_TARGET_OPTIONS[scenarioId] ?? ALERT_TARGET_OPTIONS["public-traffic"];
   const found = list.find((o) => o.value === target) ?? list[0];
   return short ? found.shortLabel : found.label;

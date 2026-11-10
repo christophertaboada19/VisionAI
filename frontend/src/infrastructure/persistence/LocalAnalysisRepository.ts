@@ -76,6 +76,13 @@ export class LocalAnalysisRepository implements AnalysisRepository {
             ...parsed.settings,
             cameras: this.normalizeCameras(parsed.settings?.cameras),
           };
+          // Migración: la regla de aforo era un conteo fijo (≥ 4 personas, en cualquier escenario).
+          // Ahora la decide el backend con el aforo configurado por cámara/análisis (patrón "crowding").
+          parsed.rules = (parsed.rules ?? []).map((rule) =>
+            rule.id === "rule-occupancy" && rule.condition.kind === "count"
+              ? { ...rule, condition: { kind: "pattern", patternType: "crowding" }, description: "Más personas que el aforo máximo configurado para la cámara o el análisis (por defecto 3)." }
+              : rule,
+          );
           return parsed;
         }
       }

@@ -156,6 +156,7 @@ async def create_analysis(
     mode: str = Form("combined"),
     threshold: float = Form(0.5),
     scenarioId: str = Form("industrial-safety"),
+    alertTarget: str = Form("all"),
     image: Optional[UploadFile] = File(None),
 ) -> Dict[str, Any]:
     analysis_id = f"AN-REAL-{uuid.uuid4().hex[:8].upper()}"
@@ -171,7 +172,11 @@ async def create_analysis(
             bgr = _generate_reference_scene_bgr(scenarioId)
 
         res = detector_engine.analyze_frame(
-            bgr=bgr, scenario_id=scenarioId, mode=_safe_mode(mode), threshold=_clamp_threshold(threshold)
+            bgr=bgr,
+            scenario_id=scenarioId,
+            mode=_safe_mode(mode),
+            threshold=_clamp_threshold(threshold),
+            alert_target=(alertTarget or "all")[:64],
         )
         _store_result(analysis_id, {
             "analysisId": analysis_id,

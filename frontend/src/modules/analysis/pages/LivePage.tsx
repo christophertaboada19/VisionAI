@@ -43,6 +43,7 @@ import { MODE_LABEL } from "@/core/domain/entities";
 import { can } from "@/core/domain/permissions";
 import { useAlerts, useAnalyses, useCameras, useClasses, useRules } from "@/shared/hooks/useRepository";
 import { ALERT_TARGET_OPTIONS, getAlertTargetLabel } from "@/modules/scenarios/data/seedCatalog";
+import { CapacityInput } from "@/modules/scenarios/components/CapacityInput";
 import { ALL_SCENARIOS, SCENARIOS } from "@/modules/scenarios/data/scenes";
 import { LIVE_HINT } from "@/modules/scenarios/data/liveScenes";
 import {
@@ -85,6 +86,7 @@ const EVENT_LABEL: Record<string, string> = {
   zone_intrusion: "Invasión de zona / carril restringido",
   traffic_congestion: "Congestión vehicular alta",
   "count:person": "Aforo máximo excedido",
+  crowding: "Aforo máximo excedido",
   abandoned_object: "Objetos abandonados (sin dueño)",
   unattended_object: "Bultos sin persona cerca (en vigilancia)",
 };
@@ -795,7 +797,10 @@ export function LivePage() {
                   ))}
                 </Select>
               </Field>
-              <Field label="Qué queremos que detecte como Alerta" htmlFor="nc-target">
+              <Field label={newCamScenario === "retail-store" ? "Aforo máximo de la sala" : "Qué queremos que detecte como Alerta"} htmlFor="nc-target">
+                {newCamScenario === "retail-store" ? (
+                  <CapacityInput id="nc-target" target={newCamAlertTarget} onChange={setNewCamAlertTarget} />
+                ) : (
                 <Select
                   id="nc-target"
                   value={newCamAlertTarget}
@@ -808,6 +813,7 @@ export function LivePage() {
                     </option>
                   ))}
                 </Select>
+                )}
               </Field>
             </div>
 
@@ -1294,7 +1300,10 @@ export function LivePage() {
                 </Field>
               </div>
               <div className="w-full sm:w-80">
-                <Field label="3. Qué detectar como Alerta en esta cámara" htmlFor="ltarget">
+                <Field label={scenarioId === "retail-store" ? "3. Aforo máximo de la sala" : "3. Qué detectar como Alerta en esta cámara"} htmlFor="ltarget">
+                  {scenarioId === "retail-store" ? (
+                    <CapacityInput id="ltarget" target={alertTarget} disabled={active} onChange={(t) => updateActiveCameraConfig({ alertTarget: t })} />
+                  ) : (
                   <Select
                     id="ltarget"
                     className="w-full"
@@ -1308,6 +1317,7 @@ export function LivePage() {
                       </option>
                     ))}
                   </Select>
+                  )}
                 </Field>
               </div>
               <Field label="Perfil de análisis">

@@ -12,7 +12,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
-from .cnn_classifier import classify_bottle_roi, classify_ppe_roi
+from .cnn_classifier import bottle_crease_score, classify_bottle_roi, classify_ppe_roi
 from .opencv_pipeline import canny_edges, encode_jpeg_data_url, extract_roi, to_grayscale
 from .abandoned import BAG_COCO, monitor_for, person_is_near, target_settings
 
@@ -183,6 +183,71 @@ def deduplicate_detections(
     # Ordenar de izquierda a derecha (por coordenada X) para que B1/T1/V1 sea siempre el de la izquierda
     kept.sort(key=lambda item: item[3][0])
     return kept
+
+
+# Carril restringido configurado en el escenario "Monitoreo vial" (mismo polígono que el frontend).
+RESTRICTED_LANE_POLYGON: List[Tuple[float, float]] = [(0.58, 0.48), (0.94, 0.48), (0.96, 0.88), (0.54, 0.88)]
+
+
+DEFAULT_MAX_OCCUPANCY = 3  # aforo por defecto: alerta a partir de 4 personas
+
+
+def parse_max_occupancy(alert_target: str) -> int:
+    """Aforo máximo configurado por el usuario: alertTarget = "capacity:N" (N personas permitidas)."""
+    if isinstance(alert_target, str) and alert_target.startswith("capacity:"):
+        try:
+            return max(1, min(10000, int(alert_target.split(":", 1)[1])))
+        except ValueError:
+            pass
+    return DEFAULT_MAX_OCCUPANCY
+
+
+def point_in_polygon(pt: Tuple[float, float], poly: List[Tuple[float, float]]) -> bool:
+    contour = np.array([[int(x * 10000), int(y * 10000)] for x, y in poly], dtype=np.int32)
+    return cv2.pointPolygonTest(contour, (float(pt[0] * 10000), float(pt[1] * 10000)), False) >= 0
+
+
+def clean_bottle_boxes(
+    dets: List[Tuple[str, str, float, Tuple[float, float, float, float]]],
+) -> List[Tuple[str, str, float, Tuple[float, float, float, float]]]:
+    """
+    Control de calidad: elimina cajas de botella espurias antes de clasificar.
+    - Cajas pequeñas dentro/encima de otra botella (una tapa o un cuello detectado como "botella").
+    - Cajas mucho más bajas que la fila (botella del fondo, reflejo) cuando hay 3+ botellas.
+    """
+    prods = [d for d in dets if d[0] == "product"]
+    if len(prods) < 2:
+        return dets
+    heights = sorted(d[3][3] for d in prods)
+    med_h = heights[len(heights) // 2]
+    kept: List[Tuple[str, str, float, Tuple[float, float, float, float]]] = []
+    for d in dets:
+        if d[0] != "product":
+            kept.append(d)
+            continue
+        box = d[3]
+        inside_other = any(
+            o is not d and o[3][2] * o[3][3] > box[2] * box[3] * 1.8 and box_containment(box, o[3]) >= 0.55
+            for o in prods
+        )
+        too_short = len(prods) >= 3 and box[3] < med_h * 0.45 and d[2] < 0.5
+        if inside_other or too_short:
+            continue
+        kept.append(d)
+    return kept
+
+
+def bottle_is_partial(
+    box: Tuple[float, float, float, float],
+    all_boxes: List[Tuple[float, float, float, float]],
+) -> bool:
+    """Botella cortada por el borde izquierdo/derecho del encuadre (no se puede juzgar su forma)."""
+    x, _, w, _ = box
+    if not (x <= 0.004 or x + w >= 0.996):
+        return False
+    widths = sorted(b[2] for b in all_boxes)
+    med_w = widths[len(widths) // 2] if widths else w
+    return len(all_boxes) >= 2 and w < med_w * 0.6
 
 
 class SimpleByteTracker:
@@ -543,8 +608,10 @@ class RealVisionDetector:
                             break
                 if is_backpack_or_chair:
                     continue
-                # 4. Si la confianza es moderada (0.45 - 0.60), validar que exista rostro o piel humana real
-                if conf < 0.60:
+                # 4. Si la confianza es moderada (0.45 - 0.60), validar que exista rostro o piel humana real.
+                #    Solo en personas grandes: en una multitud lejana o vista cenital no se ven rostros ni piel,
+                #    y esta regla descartaba a casi todas las personas pequeñas.
+                if conf < 0.60 and pix_h >= 140:
                     crop = extract_roi(bgr, box)
                     if not self._has_human_skin_or_face(crop):
                         continue
@@ -553,12 +620,111 @@ class RealVisionDetector:
                 # Permitir vehículos pequeños/lejanos en cámaras de autopista de baja calidad (área >= 0.0003)
                 if conf < 0.08 or (nw * nh) < 0.0003 or ny < 0.08:
                     continue
-                # Calibrar confianza reportada para compensar la baja resolución/compresión de cámaras CCTV
-                conf = round(min(0.97, max(0.70, 0.56 + conf * 0.50)), 3)
+                # Calibración moderada para cámaras CCTV de baja resolución. ANTES se forzaba un mínimo de 70%:
+                # cualquier sombra/edificio con 9% de YOLO pasaba el umbral (50%) y disparaba alertas.
+                # Ahora: YOLO 0.09 -> 0.29 (baja confianza, solo se dibuja), 0.32 -> 0.50, 0.60 -> 0.77.
+                conf = round(min(0.97, 0.20 + conf * 0.95), 3)
 
             out.append((class_id, label, conf, box))
 
         return deduplicate_detections(out) + deduplicate_detections(bag_candidates)
+
+    @staticmethod
+    def _on_road_surface(hsv: np.ndarray, box: Tuple[float, float, float, float]) -> bool:
+        """
+        ¿El vehículo está apoyado sobre calzada? Mira una franja justo debajo/alrededor de sus ruedas:
+        asfalto = gris (saturación baja, brillo medio) o marcas viales (blanco/amarillo). Si la franja es
+        pasto, tierra o vereda de color, el vehículo se salió de la ruta.
+        """
+        h, w = hsv.shape[:2]
+        x, y, bw, bh = box
+        x1 = int(max(0.0, x - bw * 0.1) * w)
+        x2 = int(min(1.0, x + bw * 1.1) * w)
+        y1 = int(min(1.0, y + bh * 0.85) * h)
+        y2 = int(min(1.0, y + bh * 1.25) * h)
+        if y2 - y1 < 3 or x2 - x1 < 3:
+            return True  # tocando el borde inferior: no hay evidencia para acusar
+        patch = hsv[y1:y2, x1:x2]
+        asphalt = (patch[:, :, 1] < 70) & (patch[:, :, 2] > 35) & (patch[:, :, 2] < 225)
+        markings = ((patch[:, :, 1] < 45) & (patch[:, :, 2] >= 200)) | (
+            (patch[:, :, 0] >= 15) & (patch[:, :, 0] <= 35) & (patch[:, :, 1] >= 90)
+        )
+        return float(np.mean(asphalt | markings)) >= 0.35
+
+    @staticmethod
+    def _on_sidewalk(hsv: np.ndarray, box: Tuple[float, float, float, float], vehicles: List[Dict[str, Any]]) -> bool:
+        """
+        La vereda también es gris como el asfalto. Heurística: si ningún vehículo circula a la altura de los pies
+        del peatón dentro de un radio de 2.5 anchos de vehículo, el peatón está en la vereda/borde, no en la vía.
+        """
+        feet_x = box[0] + box[2] * 0.5
+        feet_y = box[1] + box[3]
+        for v in vehicles:
+            vb = v["box"]
+            v_bottom = vb["y"] + vb["height"]
+            v_cx = vb["x"] + vb["width"] * 0.5
+            if abs(v_bottom - feet_y) <= max(0.06, vb["height"] * 0.8) and abs(v_cx - feet_x) <= vb["width"] * 2.5:
+                return False
+        return True
+
+    def _detect_people_tiled(
+        self,
+        bgr: np.ndarray,
+        conf_min: float = 0.30,
+    ) -> List[Tuple[str, str, float, Tuple[float, float, float, float]]]:
+        """
+        Conteo de personas en multitudes / cámaras altas: además de la pasada completa, YOLO se ejecuta sobre
+        4 mosaicos solapados (2x2, 60% del tamaño cada uno). Las personas lejanas, que en la imagen completa
+        miden pocos píxeles tras el redimensionado a 640/800 px, en el mosaico se ven ~1.7x más grandes.
+        """
+        h, w = bgr.shape[:2]
+        out = self._detect_with_yolo(bgr, conf_min=conf_min, allowed_coco_ids=[0], reject_clutter_for_person=True, imgsz=960)
+        if min(h, w) < 360:
+            return out
+        tw, th = int(w * 0.6), int(h * 0.6)
+        for x0 in (0, w - tw):
+            for y0 in (0, h - th):
+                tile = bgr[y0 : y0 + th, x0 : x0 + tw]
+                for cid, lbl, conf, (sx, sy, sw, sh) in self._detect_with_yolo(
+                    tile, conf_min=conf_min, allowed_coco_ids=[0], reject_clutter_for_person=True, imgsz=640
+                ):
+                    gx = (x0 + sx * tw) / w
+                    gy = (y0 + sy * th) / h
+                    gw = sw * tw / w
+                    gh = sh * th / h
+                    # Persona cortada por el borde interno del mosaico: la completa la da otro mosaico.
+                    touches_inner = (sx <= 0.003 and x0 > 0) or (sx + sw >= 0.997 and x0 + tw < w) or (
+                        sy <= 0.003 and y0 > 0
+                    ) or (sy + sh >= 0.997 and y0 + th < h)
+                    if touches_inner:
+                        continue
+                    out.append((cid, lbl, conf, (round(gx, 4), round(gy, 4), round(gw, 4), round(gh, 4))))
+        return deduplicate_detections(out, iou_threshold=0.45)
+
+    def _detect_with_padding(
+        self,
+        bgr: np.ndarray,
+        conf_min: float,
+        allowed_coco_ids: List[int],
+        pad_frac: float = 0.18,
+        imgsz: int = 640,
+    ) -> List[Tuple[str, str, float, Tuple[float, float, float, float]]]:
+        """YOLO sobre la imagen con un marco gris alrededor; devuelve cajas en coordenadas de la imagen original."""
+        h, w = bgr.shape[:2]
+        py, px = int(h * pad_frac), int(w * pad_frac)
+        padded = cv2.copyMakeBorder(bgr, py, py, px, px, cv2.BORDER_CONSTANT, value=(114, 114, 114))
+        ph, pw = padded.shape[:2]
+        out: List[Tuple[str, str, float, Tuple[float, float, float, float]]] = []
+        for cid, lbl, conf, (sx, sy, sw, sh) in self._detect_with_yolo(
+            padded, conf_min=conf_min, allowed_coco_ids=allowed_coco_ids, imgsz=imgsz
+        ):
+            x1 = max(0.0, (sx * pw - px) / w)
+            y1 = max(0.0, (sy * ph - py) / h)
+            x2 = min(1.0, ((sx + sw) * pw - px) / w)
+            y2 = min(1.0, ((sy + sh) * ph - py) / h)
+            if x2 - x1 >= 0.02 and y2 - y1 >= 0.02:
+                out.append((cid, lbl, conf, (round(x1, 4), round(y1, 4), round(x2 - x1, 4), round(y2 - y1, 4))))
+        return out
 
     def _detect_opencv_highway_vehicles(
         self,
@@ -598,7 +764,8 @@ class RealVisionDetector:
                 roi_patch = road_gray[cy : cy + ch, cx : cx + cw]
                 std_val = float(np.std(roi_patch)) if roi_patch.size else 0.0
                 if std_val >= 28.0:
-                    conf = round(min(0.84, 0.66 + min(0.18, (std_val - 28.0) / 140.0)), 3)
+                    # Respaldo por contornos: solo "candidato" de baja confianza (no dispara alertas por sí solo).
+                    conf = round(min(0.45, 0.30 + min(0.15, (std_val - 28.0) / 140.0)), 3)
                     veh_cls = "truck" if area_ratio >= 0.028 else "car"
                     veh_lbl = "Camión" if veh_cls == "truck" else "Auto"
                     candidates.append((std_val * area_ratio, (veh_cls, veh_lbl, conf, box)))
@@ -627,6 +794,10 @@ class RealVisionDetector:
             if crop.size > 0:
                 gray = to_grayscale(crop)
                 faces = self._detect_faces_safe(gray, scale_factor=1.15, min_neighbors=5, min_size=(36, 36))
+                # Solo rostros plausibles: en la mitad superior del cuerpo (un "rostro" en la cintura, una
+                # riñonera o un logo, desplazaba la caja de la persona a otra zona y arruinaba el análisis de EPP).
+                crop_h = max(1, crop.shape[0])
+                faces = [f for f in faces if (f[1] + f[3] * 0.5) <= crop_h * 0.45]
                 if len(faces) > 0:
                     fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
                     abs_fcx = (x1 + fx + fw * 0.5) / float(w)
@@ -780,8 +951,10 @@ class RealVisionDetector:
                 d["label"] = f"{kind} {oid} (no vigilado)"
                 continue
             if secs >= limit_s:
-                d["label"] = f"{kind} {oid} (ABANDONADO {int(secs)} s)"
-                if wants_patterns and d["confidence"] >= min(threshold, 0.35):
+                # En una imagen suelta no hay tiempo medido: no se inventan segundos en la etiqueta.
+                d["label"] = f"{kind} {oid} (ABANDONADO {int(secs)} s)" if temporal else f"{kind} {oid} (ABANDONADO · sin persona cerca)"
+                # Bulto con confianza baja (tacho, caja, sombra confundida con maleta): se muestra pero no alerta.
+                if wants_patterns and d["confidence"] >= min(threshold, 0.40):
                     base = 0.6 if temporal else 0.5
                     detail = (
                         f"permanece quieto {int(secs)} s sin ninguna persona cerca (límite {int(limit_s)} s)"
@@ -855,8 +1028,14 @@ class RealVisionDetector:
                     reject_clutter_for_person=False,
                     imgsz=768,
                 )
+            if sum(1 for c, _, _, _ in raw_dets if c == "product") < 3:
+                # Primer plano (botellas que llenan la foto o cortadas por el borde): YOLO las reconoce mejor
+                # con margen alrededor. Pasada extra sobre la imagen con borde y fusión sin duplicados.
+                padded = self._detect_with_padding(bgr, conf_min=0.12, allowed_coco_ids=[39, 40, 41, 75], pad_frac=0.18)
+                raw_dets = deduplicate_detections(raw_dets + padded, iou_threshold=0.5)
             if not any(c == "product" for c, _, _, _ in raw_dets):
                 raw_dets.extend(self._detect_opencv_foreground_bottle(bgr))
+            raw_dets = clean_bottle_boxes(raw_dets)
         elif scenario_id == "abandoned-objects":
             # Multiescala: YOLO reconoce mejor un bulto CERCANO (que llena la imagen) a 480 px,
             # la escena normal a 640 px y un bulto LEJANO y pequeño a 960 px.
@@ -867,7 +1046,17 @@ class RealVisionDetector:
             if not bags:
                 bags = [d for d in self._detect_with_yolo(bgr, conf_min=0.18, imgsz=960, **kw) if d[0] == "bag"]
             raw_dets = [d for d in base if d[0] != "bag"] + deduplicate_detections(bags)
-        elif scenario_id in ("industrial-safety", "retail-store"):
+            # Antes de declarar un bulto "sin dueño", confirmar que de verdad no hay nadie cerca: buscar personas
+            # pequeñas/lejanas o parcialmente tapadas con mosaicos (solo si hay algún bulto aparentemente solo).
+            persons_now = [d[3] for d in raw_dets if d[0] == "person"]
+            if any(not any(person_is_near(bg[3], p) for p in persons_now) for bg in raw_dets if bg[0] == "bag"):
+                extra_people = [d for d in self._detect_people_tiled(bgr, conf_min=0.30) if d[0] == "person"]
+                raw_dets = deduplicate_detections(raw_dets + extra_people)
+        elif scenario_id == "retail-store":
+            raw_dets = self._detect_people_tiled(bgr, conf_min=0.30)
+            if not any(c == "person" for c, _, _, _ in raw_dets):
+                raw_dets.extend(self._detect_opencv_fallback_person(bgr))
+        elif scenario_id == "industrial-safety":
             raw_dets = self._detect_with_yolo(
                 bgr,
                 conf_min=0.32,
@@ -927,13 +1116,9 @@ class RealVisionDetector:
                     }
                 )
             if class_id == "person":
-                roi_box = (
-                    round((raw_box[0] * 0.35) + (display_box[0] * 0.65), 4),
-                    round((raw_box[1] * 0.35) + (display_box[1] * 0.65), 4),
-                    round((raw_box[2] * 0.35) + (display_box[2] * 0.65), 4),
-                    round((raw_box[3] * 0.35) + (display_box[3] * 0.65), 4),
-                )
-                person_Boxes.append((det_id, roi_box, display_box, conf))
+                # El EPP se analiza sobre la caja ORIGINAL de YOLO (cuerpo completo: cabeza arriba, torso al medio).
+                # La caja "refinada" es solo visual y puede desplazarse; usarla movía la zona de casco/chaleco.
+                person_Boxes.append((det_id, raw_box, display_box, conf))
             elif class_id == "product":
                 bottle_Boxes.append((det_id, display_box, conf))
 
@@ -949,22 +1134,30 @@ class RealVisionDetector:
                 ppe = classify_ppe_roi(bgr, roi_box)
                 v_color_tag = ppe.vest_color if ppe.vest_color != "Ninguno" else "Reflectivo"
 
-                # Evaluar cumplimiento según el objetivo de alerta configurado en la cámara (alert_target)
+                # Evaluar cumplimiento según el objetivo de alerta configurado en la cámara (alert_target).
+                # Un elemento que NO se puede verificar (persona muy lejana, cabeza fuera del encuadre) no se acusa.
+                helmet_missing = not ppe.has_helmet and ppe.helmet_verifiable
+                vest_missing = not ppe.has_vest and ppe.vest_verifiable
                 if alert_target == "helmet_only":
                     is_compliant = ppe.has_helmet
+                    unverifiable = not ppe.has_helmet and not helmet_missing
                 elif alert_target == "vest_only":
                     is_compliant = ppe.has_vest
+                    unverifiable = not ppe.has_vest and not vest_missing
                 else:
                     is_compliant = ppe.ppe_complete
+                    unverifiable = not is_compliant and not helmet_missing and not vest_missing
 
                 # Actualizar la etiqueta visual de la caja de la persona para identificar en pantalla quién incumple
                 for d_item in detections:
                     if d_item["id"] == det_id:
                         if is_compliant:
                             d_item["label"] = f"Operario {track_id} (EPP OK)"
-                        elif not ppe.has_helmet and not ppe.has_vest:
+                        elif unverifiable:
+                            d_item["label"] = f"Operario {track_id} (EPP NO VERIFICABLE · muy lejos o recortado)"
+                        elif helmet_missing and vest_missing:
                             d_item["label"] = f"Operario {track_id} (SIN CASCO NI CHALECO)"
-                        elif not ppe.has_helmet:
+                        elif helmet_missing:
                             d_item["label"] = f"Operario {track_id} (SIN CASCO)"
                         else:
                             d_item["label"] = f"Operario {track_id} (SIN CHALECO)"
@@ -1040,10 +1233,10 @@ class RealVisionDetector:
                                 "relatedDetectionIds": [det_id],
                             }
                         )
-                elif wants_patterns:
-                    if not ppe.has_helmet and not ppe.has_vest:
+                elif wants_patterns and not unverifiable:
+                    if helmet_missing and vest_missing:
                         missing_title = "SIN CASCO NI CHALECO (Naranja/Verde/Plomo)"
-                    elif not ppe.has_helmet:
+                    elif helmet_missing:
                         missing_title = f"SIN CASCO DE SEGURIDAD (sí porta Chaleco {v_color_tag})"
                     else:
                         missing_title = "SIN CHALECO NARANJA/VERDE/PLOMO (sí porta casco)"
@@ -1072,10 +1265,21 @@ class RealVisionDetector:
                     )
 
         elif scenario_id == "quality-control":
+            # Comparación con las vecinas: en una fila de producción la botella aplastada "sobresale".
+            crease_by_id = {det_id: bottle_crease_score(bgr, bbox)[0] for det_id, bbox, _ in bottle_Boxes}
+            all_bottle_boxes = [b for _, b, _ in bottle_Boxes]
             for det_id, bbox, _ in bottle_Boxes:
                 track_id = det_id.split("-", 1)[-1]
                 pos_txt = position_Zone_label(bbox)
-                qc = classify_bottle_roi(bgr, bbox)
+                if bottle_is_partial(bbox, all_bottle_boxes):
+                    # Botella cortada por el borde: no se juzga (evita falsos "malograda" por media botella).
+                    for d_item in detections:
+                        if d_item["id"] == det_id:
+                            d_item["label"] = f"Botella {track_id} (PARCIAL · fuera de encuadre)"
+                    continue
+                others = [v for k, v in crease_by_id.items() if k != det_id]
+                peer_median = float(np.median(others)) if len(others) >= 2 else None
+                qc = classify_bottle_roi(bgr, bbox, peer_crease_median=peer_median)
                 brand_name = qc.brand_hint or "Botella"
 
                 # Actualizar la etiqueta visual de la caja de la botella identificando si es Botella Cielo / Comercial / Plástica
@@ -1201,14 +1405,16 @@ class RealVisionDetector:
                             }
                         )
             valid_people = [d for d in detections if d["classId"] == "person" and d["confidence"] >= threshold]
-            if wants_patterns and len(valid_people) >= 4:
+            max_occ = parse_max_occupancy(alert_target)
+            if wants_patterns and len(valid_people) > max_occ:
+                excess = len(valid_people) - max_occ
                 patterns.append(
                     {
                         "id": "p-retail-crowding",
                         "type": "crowding",
-                        "label": f"Aforo máximo excedido ({len(valid_people)} personas: {', '.join(d['trackId'] for d in valid_people)})",
-                        "confidence": round(min(0.96, 0.78 + len(valid_people) * 0.03), 3),
-                        "evidence": f"Se contabilizaron {len(valid_people)} personas superando el aforo máximo (3): {'; '.join(people_descriptions)}.",
+                        "label": f"Aforo máximo excedido: {len(valid_people)} personas (máximo {max_occ}, exceso {excess})",
+                        "confidence": round(min(0.96, 0.78 + min(excess, 6) * 0.03), 3),
+                        "evidence": f"Se contabilizaron {len(valid_people)} personas superando el aforo máximo configurado ({max_occ}): {'; '.join(people_descriptions)}.",
                         "source": "model",
                         "relatedDetectionIds": [p["id"] for p in valid_people],
                     }
@@ -1245,6 +1451,7 @@ class RealVisionDetector:
                     }
                 )
 
+            road_hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
             # Evaluar para cada vehículo si cumple la Ruta Vial Obligatoria o si incurre en la condición de alerta elegida para esta cámara (`alert_target`)
             veh_items = [d for d in detections if d["classId"] in VEHICLE_CLASSES]
             route_violations: Dict[str, Tuple[str, str, str]] = {}  # det_id -> (short_tag, pattern_title, reason_evidence)
@@ -1258,26 +1465,39 @@ class RealVisionDetector:
                 base_lbl = d_item["label"]
                 is_heavy = d_item["classId"] in ("truck", "bus")
 
-                # 1) ¿Está en el polígono derecho de carril restringido o desviándose por los extremos de la vía?
-                in_restricted_poly = 0.56 <= vcx <= 0.96 and 0.46 <= vcy <= 0.92
-                off_corridor = vcx < 0.14 or vcx > 0.64
+                # Punto de contacto con la calzada (centro inferior de la caja): es lo que define en qué carril
+                # está un vehículo en perspectiva; el centro de la caja de un bus alto "flota" sobre otro carril.
+                contact = (vcx, b["y"] + b["height"] * 0.92)
+
+                # 1) ¿Está dentro del polígono de carril restringido? ¿Se salió de la calzada (berma, vereda, pasto)?
+                in_restricted_poly = point_in_polygon(contact, RESTRICTED_LANE_POLYGON)
+                off_corridor = not in_restricted_poly and not self._on_road_surface(road_hsv, (b["x"], b["y"], b["width"], b["height"]))
 
                 # 2) ¿Es un vehículo pesado (Camión / Bus) circulando fuera del carril lento?
                 is_heavy_off_route = is_heavy and (0.20 <= vcx <= 0.62)
 
-                # 3) ¿Tiene distancia crítica (riesgo de colisión por alcance) con otro vehículo adelante?
+                # 3) ¿Tiene distancia crítica (riesgo de colisión por alcance) con el vehículo de ADELANTE en su carril?
+                #    Mismo carril = solapamiento horizontal real; "adelante" = más arriba en la imagen; la separación se
+                #    mide en múltiplos de su propio alto (en perspectiva, el tamaño aparente escala igual que la distancia).
                 close_ahead_lbl: Optional[str] = None
-                dist_x_tol = 0.095 if alert_target == "close_distance" else 0.075
-                dist_y_tol = 0.16 if alert_target == "close_distance" else 0.13
+                gap_factor = 0.45 if alert_target == "close_distance" else 0.35
                 for other in veh_items:
-                    if other["id"] == d_item["id"]:
+                    if other["id"] == d_item["id"] or other["confidence"] < min(threshold, 0.45):
                         continue
                     ob = other["box"]
-                    ocx = ob["x"] + ob["width"] * 0.5
-                    ocy = ob["y"] + ob["height"] * 0.5
-                    if abs(vcx - ocx) <= dist_x_tol and 0.01 <= abs(vcy - ocy) <= dist_y_tol:
+                    overlap_w = min(b["x"] + b["width"], ob["x"] + ob["width"]) - max(b["x"], ob["x"])
+                    same_lane = overlap_w >= 0.5 * min(b["width"], ob["width"])
+                    ahead = (ob["y"] + ob["height"]) < (b["y"] + b["height"]) - 0.25 * b["height"]
+                    scale_ok = 0.35 <= (ob["height"] / max(b["height"], 1e-6)) <= 1.25
+                    gap = b["y"] - (ob["y"] + ob["height"])  # negativo = se tocan/solapan en la imagen
+                    if same_lane and ahead and scale_ok and gap <= gap_factor * b["height"]:
                         close_ahead_lbl = f"{other['label']} {other.get('trackId', '')}".strip()
                         break
+
+                if d_item["confidence"] < min(threshold, 0.5):
+                    # Detección dudosa (vehículo diminuto, borroso o candidato OpenCV): se muestra pero no acusa.
+                    d_item["label"] = f"{base_lbl} {tid} (por confirmar · {pos_txt})"
+                    continue
 
                 if alert_target == "heavy_vehicles":
                     if is_heavy:
@@ -1380,6 +1600,16 @@ class RealVisionDetector:
                     tid = d_item.get("trackId", "P1")
                     b = d_item["box"]
                     pos_txt = position_Zone_label((b["x"], b["y"], b["width"], b["height"]))
+                    # Peatón "en vía" solo si sus pies están sobre la calzada (no en la vereda/acera) o en el carril
+                    # restringido. Antes TODA persona visible en la cámara se marcaba como peatón en la vía.
+                    feet = (b["x"] + b["width"] * 0.5, b["y"] + b["height"])
+                    on_road = point_in_polygon(feet, RESTRICTED_LANE_POLYGON) or (
+                        self._on_road_surface(road_hsv, (b["x"], b["y"], b["width"], b["height"]))
+                        and not self._on_sidewalk(road_hsv, (b["x"], b["y"], b["width"], b["height"]), veh_items)
+                    )
+                    if not on_road:
+                        d_item["label"] = f"{d_item['label']} {tid} (en vereda · {pos_txt})"
+                        continue
                     d_item["label"] = f"{d_item['label']} {tid} (PEATÓN EN VÍA · {pos_txt})"
                     if alert_target in ("all", "pedestrian_road"):
                         route_violations[d_item["id"]] = (

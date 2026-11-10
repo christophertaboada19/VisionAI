@@ -24,8 +24,6 @@ from .opencv_pipeline import (
     canny_edges,
     extract_roi,
     extract_roi_tensor,
-    sobel_gradients,
-    strict_threshold,
     to_grayscale,
 )
 
@@ -136,9 +134,114 @@ def _tight_contour_box(
     return (round(max(0.0, nx), 4), round(max(0.0, ny), 4), round(max(0.025, nw), 4), round(max(0.025, nh), 4))
 
 
+def normalize_exposure(bgr_patch: np.ndarray, target_p95: float = 225.0, max_gain: float = 2.4) -> np.ndarray:
+    """
+    Compensa fotos oscuras/subexpuestas (cámara con poca luz) antes de medir colores en HSV:
+    escala el brillo para que el percentil 95 del canal V llegue a ~225. No toca imágenes ya bien expuestas.
+    Sin esto, una etiqueta azul Cielo o un casco amarillo con poca luz caen por debajo de los umbrales de V.
+    """
+    if bgr_patch.size == 0:
+        return bgr_patch
+    v95 = float(np.percentile(np.max(bgr_patch, axis=2), 95))
+    if v95 >= 185.0 or v95 < 8.0:
+        return bgr_patch
+    gain = min(max_gain, target_p95 / v95)
+    return np.clip(bgr_patch.astype(np.float32) * gain, 0, 255).astype(np.uint8)
+
+
 # -----------------------------------------------------------------------------
 # 1. Clasificador CNN + OpenCV para Control de Calidad de Botellas (Sesión 03)
 # -----------------------------------------------------------------------------
+
+# Umbrales del "índice de pliegues" (energía de gradiente en diagonal / energía total).
+# Medido sobre fotos reales: botellas sanas 0.26-0.36, aplastadas 0.43-0.49, estable ante
+# poca/mucha luz, JPEG fuerte, desenfoque y media resolución.
+CREASE_CRUSHED = 0.40      # >= esto: aplastada aunque esté sola en la imagen
+CREASE_HEALTHY = 0.37      # <  esto: cuerpo sano
+CREASE_PEER_DELTA = 0.07   # en una fila de botellas: sobresale respecto a la mediana de sus vecinas
+UPRIGHT_TILT_DEG = 12.0    # hasta esta inclinación se miden las diagonales respecto a la vertical
+
+
+def bottle_crease_score(
+    bgr: np.ndarray,
+    bottle_box: Tuple[float, float, float, float],
+) -> Tuple[float, float, Optional[Tuple[float, float, float, float]]]:
+    """
+    Índice de pliegues/abolladuras del cuerpo de la botella.
+
+    Por qué no usamos densidad de bordes: el plástico es TRANSPARENTE, así que una botella sana deja ver
+    el fondo (máquinas, tuberías, otras botellas) y eso genera tantos bordes como una aplastada.
+    Lo que sí distingue a una botella aplastada es la ORIENTACIÓN de sus bordes: el plástico doblado forma
+    pliegues oblicuos (~45°), mientras que una botella sana sólo tiene su contorno vertical, los anillos
+    horizontales y la tipografía de la etiqueta (0° / 90°). Para botellas inclinadas se mide respecto al
+    eje dominante del envase.
+
+    Devuelve (indice 0..1, inclinación estimada en grados, caja normalizada de la zona más plegada).
+    """
+    roi = extract_roi(bgr, bottle_box)
+    if roi.shape[0] < 16 or roi.shape[1] < 10:
+        return 0.0, 0.0, None
+    # Normalizar a ancho fijo: el índice no depende de la resolución ni de la distancia a la cámara.
+    tw = 96
+    th = max(32, int(round(tw * roi.shape[0] / float(roi.shape[1]))))
+    small = cv2.resize(roi, (tw, th), interpolation=cv2.INTER_AREA)
+    g = cv2.GaussianBlur(to_grayscale(small), (3, 3), 0).astype(np.float32)
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gy)
+    ang = np.degrees(np.arctan2(gy, gx)) % 180.0
+
+    y1, y2, x1, x2 = int(th * 0.20), int(th * 0.95), int(tw * 0.15), int(tw * 0.85)
+    m = mag[y1:y2, x1:x2]
+    a = ang[y1:y2, x1:x2]
+    if m.size == 0:
+        return 0.0, 0.0, None
+    strong = m > max(20.0, float(np.percentile(m, 60)))
+    w = m[strong]
+    av = a[strong]
+    if w.size < 20 or float(w.sum()) < 1e-6:
+        return 0.0, 0.0, None
+
+    # Eje dominante (promedio circular de 4·θ: agrupa bordes horizontales y verticales en un solo eje).
+    a4 = np.radians(av * 4.0)
+    th0 = (np.degrees(np.arctan2(float((w * np.sin(a4)).sum()), float((w * np.cos(a4)).sum()))) / 4.0) % 90.0
+    tilt = float(min(th0, 90.0 - th0))
+
+    if tilt <= UPRIGHT_TILT_DEG:
+        diag_sel = np.minimum(np.abs(av - 45.0), np.abs(av - 135.0)) < 22.5
+        score = float(w[diag_sel].sum() / w.sum())
+        diag_full = np.minimum(np.abs(a - 45.0), np.abs(a - 135.0)) < 22.5
+    else:
+        # Botella inclinada: se usa una medida INVARIANTE a la rotación. R4 = concentración de los bordes
+        # en dos ejes perpendiculares (contorno + anillos). Botella sana: R4 0.32-0.44 a cualquier ángulo;
+        # aplastada (pliegues en todas direcciones): R4 0.07-0.28. Se lleva a la misma escala del índice.
+        r4 = float(abs(complex((w * np.cos(a4)).sum(), (w * np.sin(a4)).sum())) / w.sum())
+        score = 0.71 - r4
+        diag_full = np.abs(((a - th0) % 90.0) - 45.0) < 22.5
+
+    # Zona más plegada (para enmarcar el defecto): energía diagonal suavizada.
+    crease_map = np.where(diag_full & (m > 20.0), m, 0.0).astype(np.float32)
+    crease_map = cv2.GaussianBlur(crease_map, (0, 0), 5)
+    defect_box: Optional[Tuple[float, float, float, float]] = None
+    if float(crease_map.max()) > 1e-3:
+        hot = (crease_map >= crease_map.max() * 0.45).astype(np.uint8)
+        cnts, _ = cv2.findContours(hot, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if cnts:
+            cx, cy, cw, ch = cv2.boundingRect(max(cnts, key=cv2.contourArea))
+            bx, by, bw, bh = bottle_box
+            fx1 = (x1 + cx) / float(tw)
+            fy1 = (y1 + cy) / float(th)
+            fw = max(0.30, cw / float(tw))
+            fh = max(0.18, ch / float(th))
+            fx1 = min(fx1, 1.0 - fw)
+            fy1 = min(fy1, 1.0 - fh)
+            defect_box = (
+                round(bx + bw * fx1, 4),
+                round(by + bh * fy1, 4),
+                round(bw * fw, 4),
+                round(bh * fh, 4),
+            )
+    return round(score, 4), round(tilt, 1), defect_box
 
 @dataclass
 class BottleInspectionResult:
@@ -158,13 +261,20 @@ class BottleInspectionResult:
 def classify_bottle_roi(
     bgr: np.ndarray,
     bottle_box: Tuple[float, float, float, float],
+    peer_crease_median: Optional[float] = None,
 ) -> BottleInspectionResult:
     """
     Analiza el ROI de una botella/envase mediante el pipeline OpenCV (Sesión 04) + CNN (Sesión 03)
     para distinguir con alta precisión entre una BOTELLA SANA y una BOTELLA MALOGRADA
     (sin tapa en la boquilla superior, aplastada/abollada en el cuerpo o sin etiqueta).
+
+    `peer_crease_median`: mediana del índice de pliegues de las demás botellas de la misma imagen
+    (fila de producción). Permite detectar la botella que "sobresale" respecto a sus vecinas.
     """
     bx, by, bw, bh = bottle_box
+    img_h, img_w = bgr.shape[:2]
+    # Si la caja toca el borde superior, la boquilla puede estar fuera del encuadre: la tapa no es verificable.
+    top_cut = by <= 0.006
     roi = extract_roi(bgr, bottle_box)
     tensor_4d = extract_roi_tensor(bgr, bottle_box, target_size=(64, 64))
     fmap = conv2d_relu_maxpool(tensor_4d[0])  # (32, 32, 4)
@@ -185,21 +295,40 @@ def classify_bottle_roi(
         )
 
     gray = to_grayscale(roi)
-    sobel = sobel_gradients(gray)
     edges = canny_edges(gray, 38, 120)
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    hsv = cv2.cvtColor(normalize_exposure(roi), cv2.COLOR_BGR2HSV)
 
     # A. Análisis estricto de la TAPA en la corona superior (0% - 9% de la altura)
     # Importante: no bajar más allá del 9% para no confundir el anillo/precinto del cuello con la tapa.
+    # YOLO a veces recorta la caja justo debajo de la tapa: buscamos también un 6% POR ENCIMA de la caja.
     cap_h = max(4, int(rh * 0.09))
     cap_x1, cap_x2 = int(rw * 0.18), int(rw * 0.82)
-    cap_region_hsv = hsv[:cap_h, cap_x1:cap_x2]
+    ext_px = int(round(bh * img_h * 0.06))
+    y_top_abs = int(round(by * img_h))
+    x_left_abs = int(round(bx * img_w))
+    y_ext = max(0, y_top_abs - ext_px)
+    cap_bgr_ext = bgr[y_ext : y_top_abs + cap_h, max(0, x_left_abs + cap_x1) : min(img_w, x_left_abs + cap_x2)]
+    cap_region_hsv = cv2.cvtColor(normalize_exposure(cap_bgr_ext), cv2.COLOR_BGR2HSV) if cap_bgr_ext.size > 0 else hsv[:cap_h, cap_x1:cap_x2]
 
     if cap_region_hsv.size > 0:
         cap_sat_p85 = float(np.percentile(cap_region_hsv[:, :, 1], 85))
         cap_high_sat_ratio = float(np.mean(cap_region_hsv[:, :, 1] > 75))
         # También contemplar tapas blancas opacas muy brillantes (V > 215, baja saturación uniforme)
         cap_white_ratio = float(np.mean((cap_region_hsv[:, :, 2] > 218) & (cap_region_hsv[:, :, 1] < 30)))
+        # El cuello de la botella es angosto: a la altura de la tapa, los bordes laterales de la caja muestran el
+        # FONDO. Si el fondo también es blanco (pared, cielo), el blanco no prueba que haya tapa. Sin esto, una
+        # botella SIN tapa delante de una pared blanca salía "con tapa". (Los colores saturados NO se descartan así:
+        # en una fila de producción la franja lateral contiene la tapa azul de la botella vecina.)
+        y_rows = slice(y_ext, y_top_abs + cap_h)
+        strips = [
+            bgr[y_rows, max(0, x_left_abs) : max(0, x_left_abs + int(rw * 0.12))],
+            bgr[y_rows, min(img_w, x_left_abs + int(rw * 0.88)) : min(img_w, x_left_abs + rw)],
+        ]
+        strips_hsv = [cv2.cvtColor(normalize_exposure(st), cv2.COLOR_BGR2HSV) for st in strips if st.size > 0]
+        if strips_hsv:
+            bg_white = max(float(np.mean((st[:, :, 2] > 218) & (st[:, :, 1] < 30))) for st in strips_hsv)
+            if bg_white >= 0.5:
+                cap_white_ratio = 0.0
     else:
         cap_sat_p85 = 0.0
         cap_high_sat_ratio = 0.0
@@ -211,13 +340,16 @@ def classify_bottle_roi(
         + (1.2 if cap_white_ratio > 0.42 else 0.0)
     )
     has_cap = (cap_sat_p85 >= 65.0 and cap_high_sat_ratio >= 0.16) or (cap_white_ratio > 0.42)
+    # Boquilla fuera del encuadre: no se puede afirmar "sin tapa" (evita falsos MALOGRADA por recorte de cámara).
+    cap_unverifiable = top_cut and not has_cap
+    ext_rel = (y_top_abs - y_ext) / max(1.0, bh * img_h)
 
     cap_mask = ((cap_region_hsv[:, :, 1] > 70) | (cap_region_hsv[:, :, 2] > 218)).astype(np.uint8) * 255
     cap_box = (
         _tight_contour_box(
             cap_mask,
             bottle_box,
-            sub_rel=(0.18, 0.0, 0.64, 0.09),
+            sub_rel=(0.18, -ext_rel, 0.64, 0.09 + ext_rel),
             fallback_rel=(0.30, 0.005, 0.40, 0.08),
             max_norm_size=(min(0.15, bw * 0.48), min(0.09, bh * 0.11)),
         )
@@ -289,71 +421,52 @@ def classify_bottle_roi(
         label_score = round(min(0.35, max(0.05, brand_color_ratio * 1.5)), 3)
         label_box = None
 
-    # C. Análisis de Abolladura / Aplastamiento del Cuerpo (46% - 84% de la altura + Simetría + Inclinación)
-    crush_y1, crush_y2 = int(rh * 0.46), int(rh * 0.84)
-    crush_x1, crush_x2 = int(rw * 0.14), int(rw * 0.86)
-    low_body_edges = edges[crush_y1:crush_y2, crush_x1:crush_x2]
-    low_body_sobel = sobel[crush_y1:crush_y2, crush_x1:crush_x2]
-
-    # Una botella sana tiene plástico liso en la mitad inferior (baja densidad de bordes Canny ~0.02-0.055);
-    # una botella aplastada/arrugada genera numerosos pliegues internos (densidad > 0.072 y Sobel P90 alto).
-    crush_edge_density = float(np.mean(low_body_edges > 0)) if low_body_edges.size else 0.0
-    crush_sobel_p90 = float(np.percentile(low_body_sobel, 90)) if low_body_sobel.size else 0.0
-
-    # Simetría izquierda vs derecha en el cuerpo completo (24% - 82%)
-    mid_y1, mid_y2 = int(rh * 0.24), int(rh * 0.82)
-    binary = strict_threshold(sobel, thresh=42)
-    left_half = binary[mid_y1:mid_y2, : rw // 2]
-    right_half = np.fliplr(binary[mid_y1:mid_y2, rw - (rw // 2) :])
-    asymmetry = float(np.mean(np.abs(left_half.astype(np.float32) - right_half.astype(np.float32))) / 255.0)
-
-    # Relación de aspecto en píxeles reales (una botella recta y sana suele tener rh/rw >= 2.35;
-    # una botella aplastada, doblada o inclinada suele caer por debajo de 2.20)
+    # C. Análisis de Abolladura / Aplastamiento del Cuerpo: ÍNDICE DE PLIEGUES (orientación de bordes)
+    # Nota: la densidad de bordes NO sirve en plástico transparente (se ve el fondo a través de la botella
+    # sana y da tantos bordes como una aplastada). Ver `bottle_crease_score`.
+    crease, tilt_deg, crease_box = bottle_crease_score(bgr, bottle_box)
     pixel_aspect = float(rh) / max(float(rw), 1.0)
-    crease_energy = float(np.mean(fmap[10:28, 7:25, 2:]))
+    crease_energy = float(np.mean(fmap[10:28, 7:25, 2:]))  # mapa CNN (informativo)
 
-    is_crushed = (
-        crush_edge_density >= 0.072
-        or (crush_edge_density >= 0.058 and crush_sobel_p90 >= 33.0)
-        or asymmetry >= 0.21
-        or crease_energy >= 24.5
-        or pixel_aspect < 2.15
+    peer_outlier = (
+        peer_crease_median is not None
+        and crease >= CREASE_HEALTHY - 0.01
+        and (crease - peer_crease_median) >= CREASE_PEER_DELTA
     )
+    # Botella muy "rechoncha" estando recta (aplastada verticalmente) refuerza un índice dudoso.
+    squat_support = tilt_deg <= UPRIGHT_TILT_DEG and pixel_aspect < 1.9 and crease >= CREASE_HEALTHY
+    is_crushed = crease >= CREASE_CRUSHED or peer_outlier or squat_support
+    missing_cap = (not has_cap) and (not cap_unverifiable)
 
+    # Capa de salida Softmax (CNN): señales normalizadas -> probabilidades
     defect_signal = (
-        (1.75 if not has_cap else 0.0)
-        + max(0.0, (crush_edge_density - 0.055) * 26.0)
-        + max(0.0, (crush_sobel_p90 - 30.0) / 9.0)
-        + max(0.0, (asymmetry - 0.18) * 5.5)
-        + max(0.0, (crease_energy - 23.0) / 12.0)
-        + (0.95 if pixel_aspect < 2.15 else 0.0)
+        (1.75 if missing_cap else 0.0)
+        + max(0.0, (crease - CREASE_HEALTHY) * 30.0)
+        + (0.8 if peer_outlier else 0.0)
     )
-    ok_signal = 1.85 - defect_signal + (0.45 if has_cap else -0.6) + (0.35 if has_label else -1.8)
+    ok_signal = 1.6 + max(0.0, (CREASE_HEALTHY - crease) * 25.0) + (0.45 if has_cap else 0.0) + (0.35 if has_label else -1.2)
     label_issue_signal = 0.25 + (2.40 if not has_label else -0.8)
 
     probs = softmax(np.array([ok_signal, defect_signal, label_issue_signal], dtype=np.float32))
     p_ok, p_defect, p_label = float(probs[0]), float(probs[1]), float(probs[2])
+    crease_txt = f"índice de pliegues {crease:.2f}" + (
+        f" vs. {peer_crease_median:.2f} de sus vecinas" if peer_crease_median is not None else ""
+    )
 
-    if (not has_cap) or is_crushed or (p_defect >= p_ok and p_defect >= 0.42):
+    if missing_cap or is_crushed:
         reasons = []
-        if not has_cap:
+        if missing_cap:
             reasons.append("sin tapa en la boquilla")
         if is_crushed:
-            reasons.append("cuerpo aplastado/abollado detectado por pliegues Canny/Sobel y CNN")
+            reasons.append(f"cuerpo aplastado/abollado: pliegues oblicuos en el plástico ({crease_txt})")
         if not has_label:
             reasons.append("sin etiqueta comercial")
-        if not reasons:
-            reasons.append("anomalía estructural detectada en el envase")
 
-        # Si está aplastada en el cuerpo, enmarcar con precisión la zona abollada del cuerpo
-        if is_crushed and low_body_edges.size > 0:
-            defect_box = _tight_contour_box(
-                low_body_edges,
-                bottle_box,
-                sub_rel=(0.14, 0.46, 0.72, 0.38),
-                fallback_rel=(0.20, 0.48, 0.60, 0.28),
-                max_norm_size=(min(0.28, bw * 0.66), min(0.26, bh * 0.34)),
-            )
+        # Si está aplastada en el cuerpo, enmarcar la zona con más pliegues
+        if is_crushed and crease_box is not None:
+            defect_box = crease_box
+        elif is_crushed:
+            defect_box = (round(bx + bw * 0.20, 4), round(by + bh * 0.48, 4), round(bw * 0.60, 4), round(bh * 0.28, 4))
         else:
             # Si el defecto es falta de tapa, enmarcar la boquilla descubierta
             defect_box = (
@@ -363,7 +476,8 @@ def classify_bottle_roi(
                 round(bh * 0.12, 4),
             )
 
-        conf_out = round(min(0.98, max(0.84, p_defect + 0.16)), 3)
+        strength = max(0.0, crease - CREASE_HEALTHY) * 3.0 + (0.12 if missing_cap else 0.0)
+        conf_out = round(min(0.98, 0.72 + strength + (0.06 if peer_outlier else 0.0)), 3)
         return BottleInspectionResult(
             status="surface_defect",
             confidence=conf_out,
@@ -378,6 +492,7 @@ def classify_bottle_roi(
             brand_hint=brand_hint,
         )
 
+    cap_note = " (tapa fuera del encuadre, no verificable)" if cap_unverifiable else ""
     # Si tiene tapa y no está aplastada, pero NO TIENE ETIQUETA (ej. botella plástica transparente sin etiqueta):
     if not has_label:
         missing_lbl_box = (
@@ -397,21 +512,23 @@ def classify_bottle_roi(
             label_confidence=label_score,
             label_box=None,
             defect_box=missing_lbl_box,
-            evidence="Botella plástica SIN ETIQUETA comercial detectada: la banda central del envase es transparente y carece de etiqueta impresa (Cielo / tienda).",
+            evidence="Botella plástica SIN ETIQUETA comercial detectada: la banda central del envase es transparente y carece de etiqueta impresa (Cielo / tienda)." + cap_note,
             brand_hint=brand_hint,
         )
 
+    healthy_margin = max(0.0, CREASE_CRUSHED - crease) * 3.0
     return BottleInspectionResult(
         status="conforming",
-        confidence=round(min(0.98, max(0.88, p_ok + 0.12)), 3),
-        has_cap=True,
-        cap_confidence=round(max(0.82, cap_score), 3),
-        cap_box=cap_box or (round(bx + bw * 0.30, 4), round(by + bh * 0.01, 4), round(bw * 0.40, 4), round(bh * 0.08, 4)),
+        # Confianza honesta: cerca del umbral (botella inclinada, foto difícil) baja para pedir revisión humana.
+        confidence=round(min(0.98, max(0.55, 0.62 + healthy_margin)), 3),
+        has_cap=not cap_unverifiable,
+        cap_confidence=round(max(0.82, cap_score), 3) if not cap_unverifiable else 0.0,
+        cap_box=None if cap_unverifiable else (cap_box or (round(bx + bw * 0.30, 4), round(by + bh * 0.01, 4), round(bw * 0.40, 4), round(bh * 0.08, 4))),
         has_label=True,
         label_confidence=label_score,
         label_box=label_box,
         defect_box=None,
-        evidence=f"{brand_hint} SANA / CONFORME: tapa colocada, etiqueta comercial verificada y cuerpo cilíndrico sin abolladuras.",
+        evidence=f"{brand_hint} SANA / CONFORME: tapa colocada, etiqueta comercial verificada y cuerpo sin pliegues ({crease_txt}).{cap_note}",
         brand_hint=brand_hint,
     )
 
@@ -432,6 +549,8 @@ class PpeInspectionResult:
     pattern_confidence: float
     evidence: str
     vest_color: str = ""
+    helmet_verifiable: bool = True
+    vest_verifiable: bool = True
 
 
 def classify_ppe_roi(
@@ -457,38 +576,68 @@ def classify_ppe_roi(
             vest_confidence=0.0,
             vest_box=None,
             ppe_complete=False,
-            pattern_confidence=0.82,
-            evidence="Persona detectada sin evidencia clara de casco ni chaleco reflectivo.",
+            pattern_confidence=0.5,
+            evidence="Persona demasiado pequeña/lejana: el EPP no se puede verificar en la imagen.",
+            helmet_verifiable=False,
+            vest_verifiable=False,
         )
 
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    img_h, img_w = bgr.shape[:2]
+    # Fotos oscuras: compensar exposición antes de medir colores (si no, un casco amarillo con poca luz "desaparece").
+    hsv = cv2.cvtColor(normalize_exposure(roi), cv2.COLOR_BGR2HSV)
+    ycrcb = cv2.cvtColor(normalize_exposure(roi), cv2.COLOR_BGR2YCrCb)
+    skin_full = cv2.inRange(ycrcb, (40, 136, 78), (255, 173, 127))
+
+    # ¿Se puede verificar el EPP? Persona muy lejana (pocos píxeles) o con la cabeza fuera del encuadre.
+    head_cut = py <= 0.004
+    too_small = rh < 70 or rw < 28
 
     # A. Región de la Corona de la Cabeza:
-    # En cuerpo completo (ph >= 0.32) usamos estrictamente el 0% al 13% superior (centrado 26% a 74% del ancho)
-    # para que el cuello del chaleco naranja/amarillo en los hombros jamás se confunda con un casco,
-    # y descartamos gorras marrones/grises o tierra de fondo exigiendo saturación alta en cascos de color.
-    crown_frac = 0.13 if ph >= 0.32 else 0.22
-    head_y2 = max(5, int(rh * crown_frac))
-    head_x1, head_x2 = int(rw * 0.26), int(rw * 0.74)
-    head_hsv = hsv[:head_y2, head_x1:head_x2]
-    helmet_mask = np.zeros((max(1, head_y2), max(1, head_x2 - head_x1)), dtype=np.uint8)
+    # En cuerpo completo (ph >= 0.32) usamos el 0% al 15% superior (centrado 24% a 76% del ancho) para que el
+    # cuello del chaleco naranja/amarillo en los hombros jamás se confunda con un casco. Se busca también un 5%
+    # POR ENCIMA de la caja, porque YOLO a veces corta la caja de la persona justo bajo el casco.
+    crown_frac = 0.15 if ph >= 0.32 else 0.24
+    ext_px = int(round(ph * img_h * 0.05))
+    y_top_abs = int(round(py * img_h))
+    x_left_abs = int(round(px * img_w))
+    y_ext = max(0, y_top_abs - ext_px)
+    head_y2_abs = y_top_abs + max(5, int(rh * crown_frac))
+    head_x1, head_x2 = int(rw * 0.24), int(rw * 0.76)
+    head_bgr = bgr[y_ext:head_y2_abs, max(0, x_left_abs + head_x1) : min(img_w, x_left_abs + head_x2)]
+    ext_rel = (y_top_abs - y_ext) / max(1.0, ph * img_h)
+    helmet_mask = np.zeros((max(1, head_y2_abs - y_ext), max(1, head_x2 - head_x1)), dtype=np.uint8)
+    helmet_ratio = 0.0
 
-    if head_hsv.size > 0:
-        # Amarillo de seguridad (H 17..37, alta saturación y brillo; excluye tierra/gorra marrón H 10..16)
-        mask_yellow = cv2.inRange(head_hsv, (17, 115, 130), (37, 255, 255))
-        # Naranja/Rojo vivo de seguridad (S >= 145 y V >= 135 para no confundir piel ni gorras oscuras)
-        mask_red_orange1 = cv2.inRange(head_hsv, (0, 145, 135), (10, 255, 255))
-        mask_red_orange2 = cv2.inRange(head_hsv, (166, 135, 125), (180, 255, 255))
-        # Azul de seguridad
-        mask_blue = cv2.inRange(head_hsv, (96, 105, 100), (134, 255, 255))
-        # Verde de seguridad
-        mask_green = cv2.inRange(head_hsv, (40, 95, 100), (85, 255, 255))
-        # Blanco brillante de casco (V >= 210, S <= 32)
-        mask_white = cv2.inRange(head_hsv, (0, 0, 210), (180, 32, 255))
-        helmet_mask = mask_yellow | mask_red_orange1 | mask_red_orange2 | mask_blue | mask_green | mask_white
-        helmet_ratio = float(np.mean(helmet_mask > 0))
-    else:
-        helmet_ratio = 0.0
+    def _helmet_masks(patch_hsv: np.ndarray) -> List[np.ndarray]:
+        """Pintura de casco: muy saturada y MUY brillante (medido: S p50 165-200, V p50 254).
+        El pelo rubio (S < 140) o pelirrojo (V < 190) y las gorras marrones quedan fuera."""
+        return [
+            cv2.inRange(patch_hsv, (17, 140, 170), (37, 255, 255))  # amarillo
+            | cv2.inRange(patch_hsv, (0, 135, 200), (37, 255, 255))  # naranja / ámbar (continuo con el amarillo)
+            | cv2.inRange(patch_hsv, (165, 135, 200), (180, 255, 255)),  # rojo
+            cv2.inRange(patch_hsv, (96, 120, 100), (134, 255, 255)),  # azul
+            cv2.inRange(patch_hsv, (40, 110, 110), (85, 255, 255)),  # verde
+            cv2.inRange(patch_hsv, (0, 0, 215), (180, 30, 255)),  # blanco
+        ]
+
+    if head_bgr.size > 0:
+        head_hsv = cv2.cvtColor(normalize_exposure(head_bgr), cv2.COLOR_BGR2HSV)
+        helmet_mask = np.zeros(head_hsv.shape[:2], dtype=np.uint8)
+        head_skin = cv2.inRange(cv2.cvtColor(normalize_exposure(head_bgr), cv2.COLOR_BGR2YCrCb), (40, 136, 78), (255, 173, 127))
+        # Franjas laterales a la misma altura (fondo junto a la cabeza): si el "color de casco" también está
+        # ahí, es el FONDO (cielo blanco, pared amarilla, follaje verde) y no un casco.
+        side_l = bgr[y_ext:head_y2_abs, max(0, x_left_abs) : max(0, x_left_abs + int(rw * 0.14))]
+        side_r = bgr[y_ext:head_y2_abs, min(img_w, x_left_abs + int(rw * 0.86)) : min(img_w, x_left_abs + rw)]
+        sides = [cv2.cvtColor(normalize_exposure(s), cv2.COLOR_BGR2HSV) for s in (side_l, side_r) if s.size > 0]
+        for m_center, *m_sides in zip(_helmet_masks(head_hsv), *[_helmet_masks(s) for s in sides]):
+            m_center = cv2.bitwise_and(m_center, cv2.bitwise_not(head_skin))
+            c_ratio = float(np.mean(m_center > 0))
+            s_ratio = max([float(np.mean(ms > 0)) for ms in m_sides] or [0.0])
+            if s_ratio >= 0.25 and s_ratio >= c_ratio * 0.6:
+                continue  # el color está igual en el fondo: no cuenta como casco
+            helmet_mask = cv2.bitwise_or(helmet_mask, m_center)
+            helmet_ratio += c_ratio
+        helmet_ratio = min(1.0, helmet_ratio)
 
     has_helmet = helmet_ratio >= 0.14
     helmet_conf = round(min(0.97, max(0.74, 0.60 + helmet_ratio * 0.95)), 3) if has_helmet else round(helmet_ratio, 3)
@@ -496,7 +645,7 @@ def classify_ppe_roi(
         _tight_contour_box(
             helmet_mask,
             person_box,
-            sub_rel=(0.26, 0.0, 0.48, crown_frac),
+            sub_rel=(0.24, -ext_rel, 0.52, crown_frac + ext_rel),
             fallback_rel=(0.30, 0.01, 0.40, min(0.12, crown_frac)),
             max_norm_size=(min(0.20, pw * 0.42), min(0.14, ph * 0.15)),
         )
@@ -511,13 +660,18 @@ def classify_ppe_roi(
     vest_mask = np.zeros((max(1, torso_y2 - torso_y1), max(1, torso_x2 - torso_x1)), dtype=np.uint8)
     vest_color = ""
 
+    # La piel (brazos, cuello, cara) tiene tono naranja/ocre: se excluye para que no cuente como chaleco.
+    # Solo piel "apagada" (S < 150): la tela naranja en sombra cae en el mismo rango YCrCb pero es mucho más saturada.
+    skin_dull = cv2.bitwise_and(skin_full, cv2.inRange(hsv[:, :, 1], 0, 149))
+    torso_not_skin = cv2.bitwise_not(skin_dull[torso_y1:torso_y2, torso_x1:torso_x2])
+
     if torso_hsv.size > 0:
         # 1. Chaleco Naranja de alta visibilidad
-        mask_orange = cv2.inRange(torso_hsv, (4, 105, 110), (21, 255, 255))
+        mask_orange = cv2.inRange(torso_hsv, (4, 130, 110), (21, 255, 255)) & torso_not_skin
         orange_ratio = float(np.mean(mask_orange > 0))
 
         # 2. Chaleco Verde / Verde Limón reflectivo
-        mask_green = cv2.inRange(torso_hsv, (22, 90, 105), (85, 255, 255))
+        mask_green = cv2.inRange(torso_hsv, (22, 100, 105), (85, 255, 255)) & torso_not_skin
         green_ratio = float(np.mean(mask_green > 0))
 
         # 3. Chaleco Plomo / Gris de ingeniería (color plomo S <= 45, V 75..190 acompañado de cintas reflectivas plateadas/blancas V >= 205, S <= 30)
@@ -559,6 +713,10 @@ def classify_ppe_roi(
         else None
     )
 
+    # Si no se puede verificar (persona diminuta o cabeza fuera del encuadre) NO se acusa falta de EPP:
+    # se reporta como "no verificable" para no generar falsas alarmas.
+    helmet_verifiable = has_helmet or not (too_small or head_cut)
+    vest_verifiable = has_vest or not too_small
     ppe_complete = has_helmet and has_vest
     missing: List[str] = []
     if not has_helmet:
@@ -584,4 +742,6 @@ def classify_ppe_roi(
         pattern_confidence=pattern_conf,
         evidence=evidence,
         vest_color=vest_color,
+        helmet_verifiable=helmet_verifiable,
+        vest_verifiable=vest_verifiable,
     )

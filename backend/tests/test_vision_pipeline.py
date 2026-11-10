@@ -288,3 +288,77 @@ def test_rama_del_escenario_genera_patron_abandonado_y_aviso_previo():
     d[0]["label"] = "Mochila"
     detector_engine._apply_abandoned_objects(d, [], pats, 0.5, "suitcase_only", "default", True)
     assert pats == [] and "no vigilado" in d[0]["label"]
+
+
+# ---------------------------------------------------------------------------
+# Regresión de precisión con fotos reales (carpeta "imagenes de prueba")
+# ---------------------------------------------------------------------------
+import re
+from pathlib import Path
+
+import pytest
+
+from app.vision.cnn_classifier import bottle_crease_score
+from app.vision.detector import detector_engine, parse_max_occupancy, point_in_polygon, RESTRICTED_LANE_POLYGON
+
+_IMG_DIR = Path(__file__).resolve().parents[2] / "imagenes de prueba"
+
+
+def _load(name: str) -> np.ndarray:
+    path = _IMG_DIR / name
+    if not path.exists():
+        pytest.skip(f"No está la imagen de prueba {name}")
+    return cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_COLOR)
+
+
+def _bottle_states(img: np.ndarray) -> list:
+    res = detector_engine.analyze_frame(img, "quality-control", mode="combined", threshold=0.5)
+    bottles = sorted((d for d in res["detections"] if d["classId"] == "product"), key=lambda d: d["box"]["x"])
+    return [re.search(r"\((SANA|MALOGRADA|SIN ETIQUETA|PARCIAL)", d["label"]).group(1) for d in bottles]
+
+
+def test_fila_de_botellas_real_solo_las_aplastadas_son_malogradas():
+    # Antes: las 10 cajas salían MALOGRADA (el plástico transparente deja ver el fondo y eso parecía "pliegues").
+    img = _load("prueba.png")
+    expected = ["SANA", "SANA", "SANA", "MALOGRADA", "SANA", "MALOGRADA", "SANA", "MALOGRADA", "SANA"]
+    assert _bottle_states(img) == expected
+    # Robustez: poca luz, compresión JPEG fuerte y foto espejada.
+    assert _bottle_states(np.clip(img * 0.5, 0, 255).astype(np.uint8)) == expected
+    jpg = cv2.imdecode(cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 25])[1], cv2.IMREAD_COLOR)
+    assert _bottle_states(jpg) == expected
+    assert _bottle_states(cv2.flip(img, 1)) == expected[::-1]
+
+
+def test_botella_sana_vs_aplastada_inclinada():
+    img = _load("WhatsApp Image 2026-11-07 at 5.00.59 PM.jpeg")
+    assert _bottle_states(img) == ["SANA", "MALOGRADA"]
+
+
+def test_indice_de_pliegues_separa_sanas_de_aplastadas():
+    img = _load("prueba.png")
+    sanas = [(0.128, 0.383, 0.112, 0.484), (0.462, 0.388, 0.104, 0.486)]
+    aplastadas = [(0.346, 0.391, 0.116, 0.478), (0.568, 0.390, 0.118, 0.480)]
+    assert max(bottle_crease_score(img, b)[0] for b in sanas) < 0.37
+    assert min(bottle_crease_score(img, b)[0] for b in aplastadas) >= 0.40
+
+
+def test_pelo_rubio_no_es_casco_y_casco_amarillo_si():
+    def persona(color_cabeza):
+        img = np.full((320, 200, 3), 75, dtype=np.uint8)
+        cv2.ellipse(img, (100, 32), (34, 24), 0, 0, 360, color_cabeza, -1)
+        cv2.rectangle(img, (45, 75), (155, 195), (10, 115, 245), -1)  # chaleco naranja
+        return classify_ppe_roi(img, (0.1, 0.02, 0.8, 0.9))
+
+    assert persona((0, 215, 255)).has_helmet is True        # casco amarillo de seguridad
+    assert persona((110, 185, 220)).has_helmet is False     # pelo rubio (saturación baja)
+
+
+def test_aforo_configurable():
+    assert parse_max_occupancy("all") == 3
+    assert parse_max_occupancy("capacity:25") == 25
+    assert parse_max_occupancy("capacity:abc") == 3
+
+
+def test_carril_restringido_por_punto_de_contacto():
+    assert point_in_polygon((0.75, 0.70), RESTRICTED_LANE_POLYGON)
+    assert not point_in_polygon((0.30, 0.70), RESTRICTED_LANE_POLYGON)

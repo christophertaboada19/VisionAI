@@ -26,6 +26,7 @@ export class ApiVisionAdapter implements VisionEngine {
     form.append("mode", input.mode);
     form.append("threshold", String(input.threshold));
     form.append("scenarioId", input.scenarioId);
+    form.append("alertTarget", input.alertTarget ?? "all");
     if (input.source.kind === "upload") {
       const blob = await (await fetch(input.source.dataUrl)).blob();
       form.append("image", blob, input.source.fileName);

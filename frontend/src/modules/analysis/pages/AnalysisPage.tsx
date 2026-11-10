@@ -16,6 +16,7 @@ import { useAnalyses, useClasses, useRules, useSettings } from "@/shared/hooks/u
 import { ALL_SCENARIOS, SCENARIOS } from "@/modules/scenarios/data/scenes";
 import { Button, Card, cx, DemoBadge, EmptyState, Field, Notice, PageHeader, Select } from "@/shared/ui";
 import { AnalysisWorkspace, uploadCache } from "../components/AnalysisWorkspace";
+import { CapacityInput } from "@/modules/scenarios/components/CapacityInput";
 import { DEFAULT_LAYERS, Viewer } from "../components/Viewer";
 import { readImageFile, type LoadedImage } from "../validators/readImageFile";
 
@@ -49,6 +50,8 @@ export function AnalysisPage() {
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [mode, setMode] = useState<AnalysisMode>("combined");
   const [threshold, setThreshold] = useState(settings.defaultThreshold);
+  /** Aforo máximo (solo escenario "Control de aforo"): "capacity:N". */
+  const [occupancyTarget, setOccupancyTarget] = useState("all");
   const [ruleIds, setRuleIds] = useState<string[]>(() => rules.filter((r) => r.enabled).map((r) => r.id));
   const [rulesOpen, setRulesOpen] = useState(false);
   const [phase, setPhase] = useState<Phase>(initialScenario ? "ready" : "empty");
@@ -180,6 +183,7 @@ export function AnalysisPage() {
           scenarioId: scenario.id,
           mode,
           threshold,
+          alertTarget: scenario.id === "retail-store" ? occupancyTarget : "all",
           ruleIds: usesRules ? ruleIds : [],
           source: upload ? { kind: "upload", fileName: upload.fileName, mime: upload.mime, size: upload.size, dataUrl: upload.dataUrl } : { kind: "scenario" },
         },
@@ -287,6 +291,13 @@ export function AnalysisPage() {
             {phase === "processing" ? "Analizando…" : phase === "error" ? "Reintentar" : phase === "done" ? "Analizar de nuevo" : "Analizar"}
           </Button>
         </div>
+        {scenarioId === "retail-store" && (
+          <div className="border-t border-[var(--border)] px-4 py-3">
+            <Field label="Aforo máximo permitido" htmlFor="occupancy">
+              <CapacityInput id="occupancy" target={occupancyTarget} disabled={phase === "processing"} onChange={(t) => { setOccupancyTarget(t); touch(); }} />
+            </Field>
+          </div>
+        )}
         {phase === "processing" && progress && (
           <div className="border-t border-[var(--border)] px-4 py-3" role="progressbar" aria-valuenow={progress.percent} aria-valuemin={0} aria-valuemax={100} aria-label="Progreso del análisis">
             <div className="mb-1.5 flex items-center justify-between text-xs">

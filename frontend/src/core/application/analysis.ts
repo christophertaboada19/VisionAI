@@ -19,6 +19,8 @@ export interface AnalysisRequest {
   mode: AnalysisMode;
   threshold: number;
   source: AnalysisSource;
+  /** Qué alertar (p. ej. aforo máximo "capacity:N" en Control de aforo). */
+  alertTarget?: string;
   /** Reglas habilitadas para este análisis (por defecto, todas las activas). */
   ruleIds?: string[];
 }
@@ -131,7 +133,7 @@ export class AnalyzeImage {
     this.repo.saveAnalysis(base);
     this.log(user, "analysis.started", "info", `Análisis ${base.id} iniciado (${scenario.name}).`, base.id);
 
-    const input: AnalysisInput = { analysisId: base.id, scenarioId: scenario.id, mode: req.mode, threshold: req.threshold, source: req.source };
+    const input: AnalysisInput = { analysisId: base.id, scenarioId: scenario.id, mode: req.mode, threshold: req.threshold, source: req.source, alertTarget: req.alertTarget };
     const t0 = performance.now();
     try {
       const result = await this.engine.analyze(input, onProgress);

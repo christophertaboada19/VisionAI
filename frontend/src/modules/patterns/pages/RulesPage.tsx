@@ -15,6 +15,10 @@ const PATTERN_TYPES = [
   ["label_misaligned", "Etiqueta desalineada"],
   ["shelf_gap", "Hueco en estantería"],
   ["rack_occupancy", "Ocupación de rack"],
+  ["crowding", "Aforo máximo excedido (según aforo configurado)"],
+  ["zone_intrusion", "Invasión de zona / carril"],
+  ["traffic_congestion", "Congestión vehicular"],
+  ["abandoned_object", "Objeto abandonado"],
 ] as const;
 
 function describe(c: RuleCondition, className: (id: string) => string): string {

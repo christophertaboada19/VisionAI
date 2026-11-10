@@ -199,6 +199,18 @@ export function liveFrame(scenarioId: string, t: number): LiveFrameData {
         addMask(`m-person-A${i + 1}`, "person", `Persona A${i + 1} (${zoneLbl})`, "instance", boxToPoly(d.box), jit(0.87, t, i + 10));
       }
     }
+    // Aforo por defecto (3): misma regla que el backend (patrón "crowding" cuando hay MÁS personas).
+    if (baseCount > 3) {
+      patterns.push({
+        id: "p-retail-crowding",
+        type: "crowding",
+        label: `Aforo máximo excedido: ${baseCount} personas (máximo 3, exceso ${baseCount - 3})`,
+        confidence: jit(0.86, t, 30),
+        source: "model",
+        evidence: `Se contabilizaron ${baseCount} personas en el salón superando el aforo máximo configurado (3).`,
+        relatedDetectionIds: Array.from({ length: baseCount }, (_, i) => `person-A${i + 1}`),
+      });
+    }
   } else if (scenarioId === "public-traffic") {
     // Monitoreo vial en cámara pública: vehículos + carril restringido
     const zonePoly = restrictedLanePolygon();

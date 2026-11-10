@@ -17,6 +17,8 @@ export interface AnalysisInput {
   mode: AnalysisMode;
   threshold: number;
   source: AnalysisSource;
+  /** Qué alertar (p. ej. aforo máximo "capacity:N"). Por defecto "all". */
+  alertTarget?: string;
 }
 
 export interface VisionResult {
